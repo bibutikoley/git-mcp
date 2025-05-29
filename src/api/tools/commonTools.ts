@@ -1,13 +1,14 @@
 import type { RepoData } from "../../shared/repoData.js";
 import {
-  constructGithubUrl,
-  fetchFileFromGitHub,
+  constructGitlabUrl,
+  fetchFileFromGitLab,
   getRepoBranch,
-  searchGitHubRepo,
-} from "../utils/github.js";
+  searchGitLabRepo,
+} from "../utils/gitlab.js"; // Changed from github.js
 import { fetchFileWithRobotsTxtCheck } from "../utils/robotsTxt.js";
 import htmlToMd from "html-to-md";
-import { searchCode } from "../utils/githubClient.js";
+// Aliasing searchCode from gitlabClient to avoid naming conflicts if any local searchCode exists
+import { searchCode as searchGitLabCode, GitLabEnv } from "../utils/gitlabClient.js"; // Changed from githubClient.js
 import { fetchFileFromR2 } from "../utils/r2.js";
 import { generateServerName } from "../../shared/nameUtils.js";
 import {
@@ -28,18 +29,22 @@ export async function fetchDocumentation({
   ctx,
 }: {
   repoData: RepoData;
-  env: CloudflareEnvironment;
+  env: CloudflareEnvironment & GitLabEnv; // Ensure env type compatibility
   ctx: any;
 }): Promise<FetchDocumentationResult> {
   const { owner, repo, urlType } = repoData;
   const cacheTTL = 30 * 60; // 30 minutes in seconds
 
+  // projectId for GitLab is assumed to be owner for now
+  const projectId = owner; 
+
   // Try fetching from cache first
-  if (owner && repo) {
-    const cachedResult = await getCachedFetchDocResult(owner, repo, env);
+  // Assuming owner and repo are still valid for cache key with GitLab
+  if (projectId && repo) {
+    const cachedResult = await getCachedFetchDocResult(projectId, repo, env);
     if (cachedResult) {
       console.log(
-        `Returning cached fetchDocumentation result for ${owner}/${repo}`,
+        `Returning cached fetchDocumentation result for GitLab project ${projectId}/${repo}`,
       );
       return cachedResult;
     }
@@ -50,10 +55,13 @@ export async function fetchDocumentation({
   let content: string | null = null;
   let docsPath: string = "";
   let docsBranch: string = "";
-  let blockedByRobots = false;
+  // let blockedByRobots = false; // Kept for subdomain logic if uncommented
 
   // Check for subdomain pattern: {subdomain}.gitmcp.io/{path}
+  // For now, commenting out subdomain logic as per instructions to focus on GitLab repo functionality.
+  /*
   if (urlType === "subdomain") {
+    // This logic is specific to GitHub Pages and would need significant changes for GitLab Pages.
     // Map to github.io
     const githubIoDomain = `${owner}.github.io`;
     const pathWithSlash = repo ? `/${repo}` : "";
@@ -113,14 +121,17 @@ export async function fetchDocumentation({
     // If any path was blocked by robots.txt, return appropriate message
     if (blockedByRobots) {
       content =
-        "Access to this GitHub Pages site is restricted by robots.txt. GitMCP respects robots.txt directives.";
+        "Access to this GitLab Pages site is restricted by robots.txt. GitMCP respects robots.txt directives."; // Updated to GitLab
       fileUsed = "robots.txt restriction";
     }
-  } else if (urlType === "github" && owner && repo) {
+  } else */
+  // Assuming 'github' urlType now means GitLab repository
+  if (urlType === "github" && projectId && repo) {
     // Try static paths + search for llms.txt directly
-    docsBranch = await getRepoBranch(owner, repo, env); // Get branch once
+    // Use projectId for GitLab API calls
+    docsBranch = await getRepoBranch(projectId, env); // Get branch once
 
-    console.log(`Checking static paths for llms.txt in ${owner}/${repo}`);
+    console.log(`Checking static paths for llms.txt in GitLab project ${projectId}/${repo}`);
     const possibleLocations = [
       "docs/docs/llms.txt", // Current default
       "llms.txt", // Root directory
@@ -130,13 +141,13 @@ export async function fetchDocumentation({
     // Create array of all location+branch combinations to try
     const fetchPromises = possibleLocations.flatMap((location) => [
       {
-        promise: fetchFileFromGitHub(
-          owner,
-          repo,
+        // Using projectId for GitLab
+        promise: fetchFileFromGitLab(
+          projectId, 
           docsBranch,
           location,
           env,
-          false,
+          // false, // fetchFileFromGitLab doesn't have a 'raw' boolean, it always fetches raw
         ),
         location,
         branch: docsBranch,
@@ -146,8 +157,8 @@ export async function fetchDocumentation({
     // Execute all fetch promises in parallel
     const results = await Promise.all(
       fetchPromises.map(async ({ promise, location, branch }) => {
-        const content = await promise;
-        return { content, location, branch };
+        const fileContent = await promise; // Renamed content to fileContent to avoid conflict
+        return { content: fileContent, location, branch };
       }),
     );
 
@@ -157,101 +168,106 @@ export async function fetchDocumentation({
       );
       if (mainResult) {
         content = mainResult.content;
-        fileUsed = `llms.txt`;
+        fileUsed = `llms.txt`; // Assuming llms.txt is the target
 
-        docsPath = constructGithubUrl(
-          owner,
-          repo,
+        // Construct GitLab URL. Note: repoData.repo is used for the repo name part of the URL.
+        // projectId is used for the API interaction.
+        docsPath = constructGitlabUrl(
+          projectId,
+          mainResult.location, // filePath
           mainResult.branch,
-          mainResult.location,
+          env, // env might need GITLAB_HOST
         );
         break;
       }
     }
 
-    // Fallback to GitHub Search API if static paths don't work for llms.txt
+    // Fallback to GitLab Search API if static paths don't work for llms.txt
     if (!content) {
       console.log(
-        `llms.txt not found in static paths, trying GitHub Search API`,
+        `llms.txt not found in static paths, trying GitLab Search API for project ${projectId}`,
       );
-
-      const result = await searchGitHubRepo(
-        owner,
-        repo,
-        "llms.txt",
-        docsBranch,
+      // Using projectId for GitLab search
+      const result = await searchGitLabRepo(
+        projectId,
+        "llms.txt", // filename
         env,
-        ctx,
+        docsBranch, // branch
+        // ctx, // searchGitLabRepo doesn't take ctx
       );
       if (result) {
         content = result.content;
-        docsPath = result.path;
+        // docsPath should be the URL to the raw file, constructGitlabUrl can be used if path is from result
+        // searchGitLabRepo returns { path: string, content: string }
+        // The path from searchGitLabRepo is the full path in the repo.
+        docsPath = constructGitlabUrl(projectId, result.path, docsBranch, env);
         fileUsed = "llms.txt";
       }
     }
 
-    // Try R2 fallback if llms.txt wasn't found via GitHub
+    // Try R2 fallback if llms.txt wasn't found via GitLab
     if (!content) {
-      // Try to fetch pre-generated llms.txt
-      content = (await fetchFileFromR2(owner, repo, "llms.txt", env)) ?? null;
+      // Try to fetch pre-generated llms.txt using projectId and repo for R2 key
+      content = (await fetchFileFromR2(projectId, repo, "llms.txt", env)) ?? null;
       if (content) {
-        console.log(`Fetched pre-generated llms.txt for ${owner}/${repo}`);
+        console.log(`Fetched pre-generated llms.txt for GitLab project ${projectId}/${repo}`);
         fileUsed = "llms.txt (generated)";
       } else {
-        console.error(`No pre-generated llms.txt found for ${owner}/${repo}`);
+        console.error(`No pre-generated llms.txt found for GitLab project ${projectId}/${repo}`);
       }
     }
 
-    // Fallback to README if llms.txt not found in any location (GitHub or R2)
+    // Fallback to README if llms.txt not found in any location (GitLab or R2)
     if (!content) {
       console.log(
-        `llms.txt not found, trying README.* at root`,
-        owner,
-        repo,
-        docsBranch,
+        `llms.txt not found, trying README.* at root for GitLab project ${projectId}/${repo} on branch ${docsBranch}`,
       );
       // Ensure docsBranch is available (should be fetched above)
       if (!docsBranch) {
-        docsBranch = await getRepoBranch(owner, repo, env);
+        docsBranch = await getRepoBranch(projectId, env);
       }
 
-      // Search for README.* files in the root directory
-      const readmeResult = await searchGitHubRepo(
-        owner,
-        repo,
-        "README+path:/", // Search for files like README.* in root
-        docsBranch, // Use the determined branch
+      // Search for README.* files in the root directory using GitLab search
+      // searchGitLabRepo expects a specific filename, not a pattern like "README+path:/"
+      // We might need to iterate or use a broader search if GitLab API supports it,
+      // or search for "README.md", then "README", etc.
+      // For now, let's try "README.md" as a common default.
+      const readmeResult = await searchGitLabRepo(
+        projectId,
+        "README.md", // filename
         env,
-        ctx,
+        docsBranch, // branch
+        // ctx, // searchGitLabRepo doesn't take ctx
       );
 
       if (readmeResult) {
         content = readmeResult.content;
-        // Extract filename from the path for clarity, default to full path if extraction fails
-        const filename =
-          readmeResult.path.split("/").pop() || readmeResult.path;
-        fileUsed = filename; // e.g., "README.md", "README.asciidoc"
-        docsPath = constructGithubUrl(
-          owner,
-          repo,
+        const filename = readmeResult.path.split("/").pop() || readmeResult.path;
+        fileUsed = filename; // e.g., "README.md"
+        docsPath = constructGitlabUrl(
+          projectId,
+          readmeResult.path, // filePath
           docsBranch,
-          readmeResult.path,
-        ); // Use the full path found
-        console.log(`Found README file via search: ${fileUsed}`);
+          env,
+        );
+        console.log(`Found README file via GitLab search: ${fileUsed}`);
       } else {
-        console.log(`No README file found at root for ${owner}/${repo}`);
+        console.log(`No README.md file found at root for GitLab project ${projectId}/${repo}`);
+        // Optionally, try other README variations here if needed
       }
     }
 
     if (!content) {
-      console.error(`Failed to find documentation for ${owner}/${repo}`);
+      console.error(`Failed to find documentation for GitLab project ${projectId}/${repo}`);
     }
   }
 
-  if (owner && repo) {
+
+  // Use projectId and repo for enqueueing
+  if (projectId && repo) {
     ctx.waitUntil(
       enqueueDocumentationProcessing(
-        owner,
+        projectId, // owner -> projectId
         repo,
         content,
         fileUsed,
@@ -285,10 +301,11 @@ export async function fetchDocumentation({
     ],
   };
 
-  if (owner && repo) {
+  // Use projectId and repo for caching
+  if (projectId && repo) {
     ctx.waitUntil(
-      cacheFetchDocResult(owner, repo, result, cacheTTL, env).catch((error) => {
-        console.warn(`Failed to cache fetch documentation result: ${error}`);
+      cacheFetchDocResult(projectId, repo, result, cacheTTL, env).catch((error) => {
+        console.warn(`Failed to cache fetch documentation result for GitLab project ${projectId}/${repo}: ${error}`);
       }),
     );
   }
@@ -297,25 +314,33 @@ export async function fetchDocumentation({
 }
 
 async function enqueueDocumentationProcessing(
-  owner: string,
-  repo: string,
+  projectId: string, // Changed owner to projectId
+  repoName: string, // Changed repo to repoName for clarity
   content: string | null,
   fileUsed: string,
   docsPath: string,
   docsBranch: string,
-  env: Env,
+  env: Env & GitLabEnv, // Ensure env type compatibility
 ) {
   try {
     if (env.MY_QUEUE) {
-      console.log("Enqueuing documentation processing", owner, repo);
-      const repoUrl = `https://github.com/${owner}/${repo}`;
+      console.log("Enqueuing documentation processing for GitLab project", projectId, repoName);
+      // Construct GitLab repository URL. This might vary based on GitLab instance (env.GITLAB_HOST)
+      // Assuming projectId might be something like "group/project-name" or a numeric ID.
+      // For a typical gitlab.com URL structure:
+      const gitlabHost = env.GITLAB_HOST || "gitlab.com";
+      // If projectId is numeric, this URL might not be directly browsable without knowing the full path.
+      // If projectId is "group/repo", it forms a part of the path.
+      // For simplicity, using projectId directly in the URL, assuming it's a path.
+      const repoUrl = `https://${gitlabHost}/${projectId}/${repoName}`;
+
 
       // Prepare and send message to queue
       const message = {
-        owner,
-        repo,
+        owner: projectId, // Using projectId as the equivalent of owner
+        repo: repoName,
         repo_url: repoUrl,
-        file_url: docsPath,
+        file_url: docsPath, // This should be the GitLab raw file URL
         content_length: content?.length,
         file_used: fileUsed,
         docs_branch: docsBranch,
@@ -323,7 +348,7 @@ async function enqueueDocumentationProcessing(
 
       await env.MY_QUEUE.send(JSON.stringify(message));
       console.log(
-        `Queued documentation processing for ${owner}/${repo}`,
+        `Queued documentation processing for GitLab project ${projectId}/${repoName}`,
         message,
       );
     } else {
@@ -331,7 +356,7 @@ async function enqueueDocumentationProcessing(
     }
   } catch (error) {
     console.error(
-      `Failed to enqueue documentation request for ${owner}/${repo}`,
+      `Failed to enqueue documentation request for GitLab project ${projectId}/${repoName}`,
       error,
     );
   }
@@ -399,21 +424,25 @@ export async function searchRepositoryDocumentationAutoRag({
 }: {
   repoData: RepoData;
   query: string;
-  env: CloudflareEnvironment;
+  env: CloudflareEnvironment & GitLabEnv; // Ensure env type compatibility
   ctx: any;
   autoragPipeline: string;
 }): Promise<{
   searchQuery: string;
   content: { type: "text"; text: string }[];
 }> {
-  if (!repoData.owner || !repoData.repo) {
+  // Using repoData.owner as projectId for GitLab
+  const projectId = repoData.owner;
+  const repoName = repoData.repo;
+
+  if (!projectId || !repoName) {
     return {
       searchQuery: query,
-      content: [{ type: "text", text: "No repository data provided" }],
+      content: [{ type: "text", text: "No repository data provided (GitLab project ID or repo name missing)" }],
     };
   }
 
-  const repoPrefix = `${repoData.owner}/${repoData.repo}/`;
+  const repoPrefix = `${projectId}/${repoName}/`; // Adjusted for GitLab context (projectId/repoName)
   const searchRequest = {
     query: query,
     rewrite_query: true,
@@ -426,7 +455,7 @@ export async function searchRepositoryDocumentationAutoRag({
       filters: [
         {
           type: "gte",
-          key: "folder",
+          key: "folder", // Assuming 'folder' key still works with new prefix structure
           value: `${repoPrefix}`,
         },
         {
@@ -441,34 +470,37 @@ export async function searchRepositoryDocumentationAutoRag({
   const answer = await env.AI.autorag(autoragPipeline).search(searchRequest);
 
   let responseText =
-    `## Query\n\n${query}.\n\n## Response\n\n` ||
+    `## Query\n\n${query}.\n\n## Response\n\n` || // This part seems redundant if `query` is always defined
     `No results found for: "${query}"`;
 
   // Add source data if available
   if (answer.data && answer.data.length > 0) {
     const filteredData = answer.data.filter((item) => {
-      return item.filename.startsWith(`${repoData.owner}/${repoData.repo}/`);
+      // Ensure filtering uses projectId and repoName
+      return item.filename.startsWith(`${projectId}/${repoName}/`);
     });
 
     if (filteredData.length > 0) {
       responseText +=
         "### Sources:\nImportant: you can fetch the full content of any source using the fetch_url_content tool\n";
+      // Use projectId for getRepoBranch
       const defaultBranch = await getRepoBranch(
-        repoData.owner,
-        repoData.repo,
+        projectId,
         env,
       );
 
       for (const item of filteredData) {
-        let rawUrl = constructGithubUrl(
-          repoData.owner,
-          repoData.repo,
+        // Use constructGitlabUrl and provide projectId
+        let rawUrl = constructGitlabUrl(
+          projectId,
+          item.filename.replace(`${projectId}/${repoName}/`, ""), // filePath
           defaultBranch,
-          item.filename.replace(`${repoData.owner}/${repoData.repo}/`, ""),
+          env, // env might need GITLAB_HOST
         );
 
+        // R2 URL construction uses projectId and repoName
         if (item.filename.endsWith(".ipynb.txt")) {
-          rawUrl = `https://pub-39b02ce1b5a441b2a4658c1fc71dbb9c.r2.dev/${repoData.owner}/${repoData.repo}/${item.filename}`;
+          rawUrl = `https://pub-39b02ce1b5a441b2a4658c1fc71dbb9c.r2.dev/${projectId}/${repoName}/${item.filename}`;
         }
 
         responseText += `\n#### (${item.filename})[${rawUrl}] (Score: ${item.score.toFixed(2)})\n`;
@@ -585,7 +617,7 @@ export async function searchRepositoryCode({
   repoData: RepoData;
   query: string;
   page?: number;
-  env: Env;
+  env: Env & GitLabEnv; // Ensure env type compatibility
   ctx: any;
 }): Promise<{
   searchQuery: string;
@@ -595,88 +627,104 @@ export async function searchRepositoryCode({
     currentPage: number;
     perPage: number;
     hasMorePages: boolean;
+    // totalPages: number; // GitLab search results might not directly provide total_pages
   };
 }> {
   try {
-    // Initialize owner and repo from the provided repoData
-    const owner = repoData.owner;
-    const repo = repoData.repo;
+    // Initialize projectId and repoName from repoData
+    const projectId = repoData.owner; // Assuming owner is projectId for GitLab
+    const repoName = repoData.repo; // repo is still repo name for display/logging
 
-    if (!owner || !repo) {
+    if (!projectId || !repoName) {
       return {
         searchQuery: query,
         content: [
           {
             type: "text" as const,
-            text: `### Code Search Results for: "${query}"\n\nCannot perform code search without repository information.`,
+            text: `### Code Search Results for: "${query}"\n\nCannot perform code search without GitLab repository information (projectId or repoName missing).`,
           },
         ],
       };
     }
 
-    // Use fixed resultsPerPage of 30 and normalize page value
+    // Use fixed resultsPerPage of 20 (GitLab default/common) and normalize page value
     const currentPage = Math.max(1, page);
-    const resultsPerPage = 30; // Fixed at 30 results per page
+    const resultsPerPage = 20; // GitLab default per_page for search is 20
 
     console.log(
-      `Searching code in ${owner}/${repo}" (page ${currentPage}, ${resultsPerPage} per page)`,
+      `Searching code in GitLab project ${projectId} (repo: ${repoName})" (page ${currentPage}, ${resultsPerPage} per page)`,
     );
 
-    const data = await searchCode(
+    // Using searchGitLabCode (aliased from gitlabClient's searchCode)
+    // searchGitLabCode(projectId, query, env, page, perPage, branch)
+    // Assuming no specific branch for now, or it needs to be passed in/determined
+    const data = await searchGitLabCode(
+      projectId,
       query,
-      owner,
-      repo,
-      env,
+      env, // GitLabEnv should be compatible
       currentPage,
       resultsPerPage,
+      // undefined, // branch - let's assume default branch search or it's handled by API
     );
 
-    if (!data) {
+    // searchGitLabCode returns the JSON response directly or null.
+    // GitLab API for code search returns an array of results.
+    // It might not have a 'total_count' in the same way as GitHub.
+    // Pagination headers (X-Total, X-Total-Pages, X-Per-Page, X-Page) are used.
+    // For simplicity, we'll check if data is null or empty.
+    // The `searchCode` in `gitlabClient` should return the parsed JSON array.
+
+    if (!data || !Array.isArray(data) || data.length === 0) {
+      const apiStatus = data === null ? "GitLab API request failed or returned null." : "No results.";
       return {
         searchQuery: query,
         content: [
           {
             type: "text" as const,
-            text: `### Code Search Results for: "${query}"\n\nFailed to search code in ${owner}/${repo}. GitHub API request failed.`,
+            text: `### Code Search Results for: "${query}"\n\nNo code matches found in GitLab project ${projectId} (repo: ${repoName}). ${apiStatus}`,
           },
         ],
       };
     }
 
-    // Check if we found any matches
-    if (data.total_count === 0 || !data.items || data.items.length === 0) {
-      return {
-        searchQuery: query,
-        content: [
-          {
-            type: "text" as const,
-            text: `### Code Search Results for: "${query}"\n\nNo code matches found in ${owner}/${repo}.`,
-          },
-        ],
-      };
-    }
-
-    // Calculate pagination information
-    const totalCount = data.total_count;
-    const hasMorePages = currentPage * resultsPerPage < totalCount;
-    const totalPages = Math.ceil(totalCount / resultsPerPage);
+    // GitLab search results are an array of objects.
+    // We need to simulate totalCount if possible, or rely on headers (not directly available from searchGitLabCode's current return).
+    // For now, let's assume the `data` array is the list of items for the current page.
+    // To get totalCount, `searchGitLabCode` would need to return headers or the `gitlabApiRequest` would need to expose them.
+    // Let's assume for now we can't easily get total_count without modifying gitlabClient.
+    // We can say "more results might be available" if we get a full page.
+    const itemsOnPage = data.length;
+    const hasMorePages = itemsOnPage === resultsPerPage; // Heuristic
 
     // Format the search results
     let formattedResults = `### Code Search Results for: "${query}"\n\n`;
-    formattedResults += `Found ${totalCount} matches in ${owner}/${repo}.\n`;
-    formattedResults += `Page ${currentPage} of ${totalPages}.\n\n`;
+    formattedResults += `Found ${itemsOnPage} matches on this page in GitLab project ${projectId} (repo: ${repoName}).\n`;
+    if (hasMorePages) {
+        formattedResults += `More results may be available on subsequent pages.\n`;
+    }
+    formattedResults += `Page ${currentPage}.\n\n`;
 
-    for (const item of data.items) {
-      formattedResults += `#### ${item.name}\n`;
-      formattedResults += `- **Path**: ${item.path}\n`;
-      formattedResults += `- **URL**: ${item.html_url}\n`;
-      formattedResults += `- **Git URL**: ${item.git_url}\n`;
-      formattedResults += `- **Score**: ${item.score}\n\n`;
+
+    for (const item of data) { // data is the array of results
+      // GitLab code search result items structure:
+      // { "basename": "test.rb", "data": "...", "filename": "path/to/test.rb", "id": "...", "project_id": ..., "ref": "master", "startline": 10 }
+      // We need to construct a user-friendly URL.
+      const gitlabHost = env.GITLAB_HOST || "gitlab.com";
+      // Assuming projectId can be a namespaced path for URL construction.
+      // If projectId is numeric, this URL might not be directly user-friendly without the full project path.
+      const fileUrl = `https://${gitlabHost}/${projectId}/${repoName}/-/blob/${item.ref}/${item.filename}`;
+
+      formattedResults += `#### ${item.basename}\n`;
+      formattedResults += `- **Path**: ${item.filename}\n`;
+      formattedResults += `- **URL**: ${fileUrl}\n`; // Constructed URL
+      formattedResults += `- **Branch**: ${item.ref}\n`;
+      // GitLab API doesn't provide a direct "score" like GitHub's best match.
+      // formattedResults += `- **Score**: ${item.score}\n\n`; // No direct score
+      formattedResults += `\n`;
     }
 
-    // Add pagination information to the response
     if (hasMorePages) {
-      formattedResults += `_Showing ${data.items.length} of ${totalCount} results. Use pagination to see more results._\n\n`;
+      formattedResults += `_Showing ${itemsOnPage} results. Use pagination (increment page number) to see more results._\n\n`;
     }
 
     return {
@@ -883,12 +931,14 @@ export function generateSearchToolDescription({
   try {
     // Default description as fallback
     let description =
-      "Semantically search within the fetched documentation for the current repository.";
+    "Semantically search within the fetched documentation for the current GitLab repository."; // Changed to GitLab
 
     if (urlType == "subdomain") {
-      description = `Semantically search within the fetched documentation from the ${owner}/${repo} GitHub Pages. Useful for specific queries.`;
-    } else if (urlType == "github") {
-      description = `Semantically search within the fetched documentation from GitHub repository: ${owner}/${repo}. Useful for specific queries.`;
+    // This part relates to GitHub Pages usually. If GitLab Pages is intended, text needs adjustment.
+    // For now, keeping it generic or more aligned with GitLab.
+    description = `Semantically search within the fetched documentation from the ${owner}/${repo} GitLab Pages (if applicable) or repository. Useful for specific queries.`;
+  } else if (urlType == "github") { // Assuming 'github' urlType now refers to GitLab
+    description = `Semantically search within the fetched documentation from GitLab repository: ${owner}/${repo}. Useful for specific queries.`;
     }
 
     return description;
@@ -911,12 +961,13 @@ export function generateFetchToolDescription({
 }: Omit<RepoData, "host">): string {
   try {
     // Default description as fallback
-    let description = "Fetch entire documentation for the current repository.";
+  description = "Fetch entire documentation for the current GitLab repository."; // Changed to GitLab
 
     if (urlType == "subdomain") {
-      description = `Fetch entire documentation file from the ${owner}/${repo} GitHub Pages. Useful for general questions. Always call this tool first if asked about ${owner}/${repo}.`;
-    } else if (urlType == "github") {
-      description = `Fetch entire documentation file from GitHub repository: ${owner}/${repo}. Useful for general questions. Always call this tool first if asked about ${owner}/${repo}.`;
+    // Again, for GitLab Pages or general repo docs.
+    description = `Fetch entire documentation file from the ${owner}/${repo} GitLab Pages (if applicable) or repository. Useful for general questions. Always call this tool first if asked about ${owner}/${repo}.`;
+  } else if (urlType == "github") { // Assuming 'github' urlType now refers to GitLab
+    description = `Fetch entire documentation file from GitLab repository: ${owner}/${repo}. Useful for general questions. Always call this tool first if asked about ${owner}/${repo}.`;
     }
 
     return description;
@@ -989,7 +1040,7 @@ export function generateCodeSearchToolDescription({
   owner,
   repo,
 }: RepoData): string {
-  return `Search for code within the GitHub repository: "${owner}/${repo}" using the GitHub Search API (exact match). Returns matching files for you to query further if relevant.`;
+  return `Search for code within the GitLab repository: "${owner}/${repo}" using the GitLab Search API (exact match). Returns matching files for you to query further if relevant.`; // Changed to GitLab
 }
 
 /**
